@@ -12,6 +12,11 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHUNK_SECONDS = 40
 
+# When set, all Bot API calls are routed through a self-hosted Telegram Local
+# Bot API Server (e.g. "http://telegram-local-api.railway.internal:8081")
+# instead of the cloud API. The local server removes the 20MB download limit.
+TELEGRAM_LOCAL_API_SERVER = os.environ.get("TELEGRAM_LOCAL_API_SERVER")
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
 
@@ -152,7 +157,14 @@ async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+
+    if TELEGRAM_LOCAL_API_SERVER:
+        server = TELEGRAM_LOCAL_API_SERVER.rstrip("/")
+        logger.info("Routing Bot API calls through Local Bot API Server at %s", server)
+        builder = builder.base_url(f"{server}/bot").base_file_url(f"{server}/file/bot").local_mode(True)
+
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("reset", cancel))
