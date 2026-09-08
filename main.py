@@ -10,6 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Upda
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+API_SERVER_URL = os.environ.get("API_SERVER_URL", "http://localhost:8081")
 CHUNK_SECONDS = 40
 
 if not BOT_TOKEN:
@@ -152,7 +153,14 @@ async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .base_url(f"{API_SERVER_URL}/bot")
+        .base_file_url(f"{API_SERVER_URL}/file/bot")
+        .local_mode(True)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("reset", cancel))
