@@ -32,7 +32,6 @@ def ffprobe_duration(path: Path) -> float:
 
 
 def make_chunk(src: Path, dst: Path, start: float, duration: float) -> None:
-    # Re-encode for frame-accurate 40-second boundaries and continuous coverage.
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}",
@@ -44,6 +43,7 @@ def make_chunk(src: Path, dst: Path, start: float, duration: float) -> None:
 
 def cleanup(user_id: int) -> None:
     session = sessions.pop(user_id, None)
+    locks.pop(user_id, None)
     if session:
         shutil.rmtree(session["dir"], ignore_errors=True)
 
@@ -88,11 +88,7 @@ async def process_and_send(user_id: int, bot, index: int):
             reply_markup=keyboard(index + 1 < session["total"]),
         )
 
-    try:
-        output.unlink()
-    except OSError:
-        pass
-
+    output.unlink(missing_ok=True)
     session["index"] = index + 1
     if session["index"] >= session["total"]:
         cleanup(user_id)
@@ -106,20 +102,17 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = update.message
-    if msg.video:
-        tg_file = await context.bot.get_file(msg.video.file_id)
-        filename = "video.mp4"
-    elif msg.document and (msg.document.mime_type or "").startswith("video/"):
-        tg_file = await context.bot.get_file(msg.document.file_id)
-        filename = "video.mp4"
-    else:
-        await msg.reply_text("❌ Video file மட்டும் அனுப்புங்கள்.")
+    if not msg or not (msg.video or (msg.document and (msg.document.mime_type or "").startswith("video/"))):
+        if msg:
+            await msg.reply_text("❌ Video file மட்டும் அனுப்புங்கள்.")
         return
 
     temp_dir = tempfile.mkdtemp(prefix=f"video_{user_id}_")
-    source = Path(temp_dir) / filename
+    source = Path(temp_dir) / "video.mp4"
     await msg.reply_text("📥 Video download செய்கிறேன்...")
     try:
+        file_id = msg.video.file_id if msg.video else msg.document.file_id
+        tg_file = await context.bot.get_file(file_id)
         await tg_file.download_to_drive(custom_path=str(source))
         duration = await asyncio.to_thread(ffprobe_duration, source)
         total = max(1, int((duration + CHUNK_SECONDS - 1) // CHUNK_SECONDS))
@@ -134,7 +127,7 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Video processing failed")
         cleanup(user_id)
-        await msg.reply_text("❌ Video process செய்ய முடியவில்லை. வேறு video முயற்சிக்கவும்.")
+        await msg.reply_text("❌ Video process செய்ய முடியவில்லை. Video Telegram download limit-க்கு மேல் இருந்தால் Local Bot API Server தேவை.")
 
 
 async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
