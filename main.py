@@ -5,11 +5,14 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
+import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "").rstrip("/")
 CHUNK_SECONDS = 40
 
 if not BOT_TOKEN:
@@ -52,6 +55,20 @@ def keyboard(has_next: bool):
     if not has_next:
         return None
     return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ அடுத்து", callback_data="NEXT")]])
+
+
+async def download_local_file(file_path: str, destination: Path) -> None:
+    if not LOCAL_BOT_API_URL:
+        raise RuntimeError("LOCAL_BOT_API_URL is not configured")
+    relative_path = quote(file_path.lstrip("/"), safe="/")
+    url = f"{LOCAL_BOT_API_URL}/file/bot{BOT_TOKEN}/{relative_path}"
+    timeout = httpx.Timeout(connect=60.0, read=None, write=60.0, pool=60.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            with destination.open("wb") as out:
+                async for chunk in response.aiter_bytes(1024 * 1024):
+                    out.write(chunk)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -113,7 +130,11 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file_id = msg.video.file_id if msg.video else msg.document.file_id
         tg_file = await context.bot.get_file(file_id)
-        await tg_file.download_to_drive(custom_path=str(source))
+        if LOCAL_BOT_API_URL and tg_file.file_path:
+            await download_local_file(tg_file.file_path, source)
+        else:
+            await tg_file.download_to_drive(custom_path=str(source))
+
         duration = await asyncio.to_thread(ffprobe_duration, source)
         total = max(1, int((duration + CHUNK_SECONDS - 1) // CHUNK_SECONDS))
         sessions[user_id] = {
@@ -127,7 +148,7 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Video processing failed")
         cleanup(user_id)
-        await msg.reply_text("❌ Video process செய்ய முடியவில்லை. Video Telegram download limit-க்கு மேல் இருந்தால் Local Bot API Server தேவை.")
+        await msg.reply_text("❌ Video process செய்ய முடியவில்லை. Local Bot API connection அல்லது video download-ஐ சரிபார்க்க வேண்டும்.")
 
 
 async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -152,7 +173,10 @@ async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if LOCAL_BOT_API_URL:
+        builder = builder.base_url(f"{LOCAL_BOT_API_URL}/bot").base_file_url(f"{LOCAL_BOT_API_URL}/file/bot").local_mode(True)
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("reset", cancel))
