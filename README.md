@@ -5,8 +5,8 @@ Telegram bot that sends a video in sequential 40-second parts. Only the first pa
 ## Railway
 
 1. Create a Railway service from this GitHub repository.
-2. Add environment variable `BOT_TOKEN` with your BotFather token. Never commit the token to GitHub.
-3. Deploy. FFmpeg is installed by the Dockerfile.
+2. Add environment variables `BOT_TOKEN`, `TELEGRAM_API_ID`, and `TELEGRAM_API_HASH`. Never commit these to GitHub.
+3. Deploy. FFmpeg, TDLib, and the Local Bot API Server binary are built and installed by the Dockerfile.
 
 ## Commands
 
@@ -14,6 +14,6 @@ Telegram bot that sends a video in sequential 40-second parts. Only the first pa
 - `/cancel` — cancel the current video and remove temporary files
 - `/reset` — same as cancel
 
-## Important Telegram file limits
+## Local Bot API Server
 
-Standard Telegram Bot API limits may prevent very large videos from being downloaded by the bot. For very large inputs, use a Telegram Local Bot API Server or another supported large-file architecture.
+This bot runs a Local Bot API Server (built from TDLib) inside the container, listening on `http://localhost:8081`. `entrypoint.sh` starts the local server first, waits for it to become ready, and then starts `main.py`, which points `python-telegram-bot` at the local server via `API_SERVER_URL` (defaults to `http://localhost:8081`). This bypasses the 20 MB file size limit imposed by Telegram's cloud Bot API, since files are downloaded directly to the container filesystem.
