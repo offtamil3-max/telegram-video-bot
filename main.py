@@ -26,6 +26,17 @@ logger = logging.getLogger(__name__)
 sessions = {}
 locks = {}
 
+# IMPORTANT: The entire bot must poll through the Local Bot API server.
+# If updates are received from Telegram's hosted API, the Local Bot API server
+# does not have the uploaded file in its local storage and getFile can return
+# "File is too big" for large videos. Polling locally makes the same update/file
+# available to the Local Bot API server, which supports large local files.
+local_bot = Bot(
+    token=BOT_TOKEN,
+    base_url=f"{LOCAL_BOT_API_URL}/bot",
+    base_file_url=f"{LOCAL_BOT_API_URL}/file/bot",
+)
+
 
 def ffprobe_duration(path: Path) -> float:
     result = subprocess.run(
@@ -130,20 +141,12 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file_id = msg.video.file_id if msg.video else msg.document.file_id
 
-        # IMPORTANT: getFile must be called on the Local Bot API server.
-        # Telegram's hosted Bot API has a small download limit; the Local Bot API
-        # has access to the downloaded file in its own local storage.
-        local_bot = Bot(
-            token=BOT_TOKEN,
-            base_url=f"{LOCAL_BOT_API_URL}/bot",
-            base_file_url=f"{LOCAL_BOT_API_URL}/file/bot",
+        # getFile is intentionally called on the Local Bot API. Because the
+        # update itself was received through Local Bot API polling, the uploaded
+        # file is available in the Local Bot API's local storage.
+        tg_file = await context.bot.get_file(
+            file_id, read_timeout=120, connect_timeout=60, write_timeout=120, pool_timeout=60,
         )
-        try:
-            tg_file = await local_bot.get_file(
-                file_id, read_timeout=120, connect_timeout=60, write_timeout=120, pool_timeout=60,
-            )
-        finally:
-            await local_bot.shutdown()
 
         if not tg_file.file_path:
             raise RuntimeError("Local Bot API returned no file path")
@@ -188,7 +191,8 @@ async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Polling MUST use Local Bot API, not Telegram's hosted API.
+    app = Application.builder().bot(local_bot).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("reset", cancel))
