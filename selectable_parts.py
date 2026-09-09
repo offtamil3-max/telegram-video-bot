@@ -18,6 +18,8 @@ API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 BOT_ROLE = os.environ.get("BOT_ROLE", "primary").lower()
 CHUNK = 40
+DOWNLOAD_REQUEST = 512 * 1024
+DOWNLOAD_WORKERS = 2
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 sessions, locks, active = {}, {}, set()
@@ -61,19 +63,58 @@ def keyboard(total, dur):
     return rows
 
 
+async def _download_range(message, dest, start, end, size, state):
+    chunk_count = math.ceil((end - start) / DOWNLOAD_REQUEST)
+    written = 0
+    with dest.open("r+b") as f:
+        f.seek(start)
+        async for chunk in client.iter_download(
+            message,
+            offset=start,
+            limit=chunk_count,
+            request_size=DOWNLOAD_REQUEST,
+            chunk_size=DOWNLOAD_REQUEST,
+            file_size=size,
+        ):
+            remaining = end - (start + written)
+            data = chunk[:remaining]
+            f.write(data)
+            written += len(data)
+            state["n"] += len(data)
+            if start + written >= end:
+                break
+    if written != end - start:
+        raise RuntimeError(f"Download range incomplete: {start}-{end}, got {written} bytes")
+
+
+async def _parallel_download(message, dest, size, state):
+    with dest.open("wb") as f:
+        f.truncate(size)
+    ranges = []
+    step = math.ceil(size / DOWNLOAD_WORKERS / DOWNLOAD_REQUEST) * DOWNLOAD_REQUEST
+    start = 0
+    while start < size:
+        end = min(size, start + step)
+        ranges.append((start, end))
+        start = end
+    await asyncio.gather(*(
+        _download_range(message, dest, a, b, size, state)
+        for a, b in ranges
+    ))
+
+
 async def download(message, dest, status):
-    size = getattr(message.file, "size", 0) or 1
+    size = getattr(message.file, "size", 0) or 0
+    if size <= 0:
+        raise RuntimeError("Telegram did not provide the video size")
     state = {"n": 0}
     started = time.monotonic()
-
-    def cb(cur, total):
-        state["n"] = cur
 
     async def show():
         last = ""
         while True:
             await asyncio.sleep(2)
-            cur = state["n"]
+            cur = min(state["n"], size)
             pct = cur * 100 / size
             elapsed = max(time.monotonic() - started, 0.1)
             speed = cur / elapsed / 1024 / 1024
@@ -81,7 +122,8 @@ async def download(message, dest, status):
             text = (
                 f"📥 Full video download\n{pct:.0f}% • "
                 f"{cur / 1024 / 1024:.1f} / {size / 1024 / 1024:.1f} MB\n"
-                f"⚡ {speed:.2f} MB/s • ETA ~{int(eta)}s"
+                f"⚡ {speed:.2f} MB/s • ETA ~{int(eta)}s\n"
+                f"🚀 {DOWNLOAD_WORKERS} parallel Telegram streams"
             )
             if text != last:
                 try:
@@ -92,7 +134,7 @@ async def download(message, dest, status):
 
     task = asyncio.create_task(show())
     try:
-        await client.download_media(message, file=str(dest), progress_callback=cb)
+        await _parallel_download(message, dest, size, state)
     finally:
         task.cancel()
         try:
@@ -100,13 +142,13 @@ async def download(message, dest, status):
         except asyncio.CancelledError:
             pass
 
-    if not dest.exists() or dest.stat().st_size == 0:
-        raise RuntimeError("Downloaded video file is missing or empty")
-    actual = dest.stat().st_size
+    if not dest.exists() or dest.stat().st_size != size:
+        raise RuntimeError("Downloaded video file is missing or incomplete")
     elapsed = max(time.monotonic() - started, 0.1)
     await status.edit(
-        f"✅ Full video downloaded\n{actual / 1024 / 1024:.1f} MB • "
-        f"{actual / elapsed / 1024 / 1024:.2f} MB/s"
+        f"✅ Full video downloaded\n{size / 1024 / 1024:.1f} MB • "
+        f"{size / elapsed / 1024 / 1024:.2f} MB/s\n"
+        f"🚀 {DOWNLOAD_WORKERS} parallel Telegram streams"
     )
 
 
