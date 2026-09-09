@@ -7,8 +7,6 @@ from pathlib import Path
 import selectable_parts
 from telethon import Button, events
 
-# Prefer Render/system FFmpeg because it has the drawtext filter required by the
-# vertical compositor. Fall back to imageio-ffmpeg where system FFmpeg is absent.
 SYSTEM_FFMPEG = shutil.which("ffmpeg")
 if SYSTEM_FFMPEG:
     selectable_parts.FFMPEG = SYSTEM_FFMPEG
@@ -36,7 +34,6 @@ def list_audio_tracks(path):
     if not tracks:
         raise RuntimeError("No audio track found")
     for t in tracks:
-        # Preserve the file metadata. No artificial language/name is added.
         t["label"] = t["title"] if t["title"] else t["lang"]
         if not t["label"]:
             t["label"] = "\u200b"
@@ -60,8 +57,6 @@ def make_part_compat(src, bg, out, start, length, overlay_text, footer_text, aud
         f"[base]drawtext=text='{title}':fontcolor=white:fontsize=58:box=1:boxcolor=black@0.65:boxborderw=18:x=(w-text_w)/2:y=45,"
         f"drawtext=text='{footer}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.65:boxborderw=14:x=(w-text_w)/2:y=h-text_h-55[v]"
     )
-    # Render's free instance has a 512 MiB memory ceiling. Limit both x264 and
-    # libavfilter threading so a single 1080x1920 encode cannot exhaust it.
     cmd = [
         selectable_parts.FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
         "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
@@ -79,9 +74,10 @@ def make_part_compat(src, bg, out, start, length, overlay_text, footer_text, aud
 
 async def video_manual(event):
     uid, msg = event.sender_id, event.message
-    if not uid or uid in selectable_parts.active:
-        if uid in selectable_parts.active:
-            await event.respond("⚠️ ஏற்கனவே ஒரு video processing-ல் உள்ளது. /cancel பயன்படுத்தவும்.")
+    if not uid:
+        return
+    if uid in selectable_parts.active:
+        await event.respond("⚠️ Video இன்னும் தயாராகிறது. முடியும் வரை காத்திருக்கவும்.")
         return
     mime = getattr(msg.file, "mime_type", None) if msg.file else None
     if not mime or not mime.startswith("video/"):
@@ -99,12 +95,25 @@ async def video_manual(event):
         dur = await asyncio.to_thread(selectable_parts.duration, src)
         tracks = await asyncio.to_thread(list_audio_tracks, src)
         total = max(1, __import__("math").ceil(dur / selectable_parts.CHUNK))
-        selectable_parts.sessions[uid] = {"dir": d, "background": s["background"], "source": str(src), "duration": dur, "total": total, "audio_tracks": tracks, "state": "choose_audio"}
+        selectable_parts.sessions[uid] = {
+            "dir": d,
+            "background": s["background"],
+            "source": str(src),
+            "duration": dur,
+            "total": total,
+            "audio_tracks": tracks,
+            "state": "choose_audio",
+        }
+        # Full-video preparation is finished. Do not keep the user in the
+        # global processing state, otherwise later messages trigger a false
+        # "already processing" warning.
+        selectable_parts.active.discard(uid)
         await event.respond(
             f"✅ Full video ready\n\n⏱️ Duration: {selectable_parts.ts(dur)}\n🎧 Audio tracks: {len(tracks)}\n\n👇 File-ல் இருக்கும் audio track name அப்படியே தேர்வு செய்யுங்கள்:",
-            buttons=audio_keyboard(tracks)
+            buttons=audio_keyboard(tracks),
         )
     except Exception as e:
+        selectable_parts.active.discard(uid)
         selectable_parts.cleanup(uid)
         print(f"Video prepare error for {uid}: {type(e).__name__}: {e}")
         await event.respond("❌ Video prepare செய்ய முடியவில்லை. மீண்டும் முயற்சி செய்யுங்கள்.")
@@ -120,6 +129,7 @@ async def part_manual(event):
     if data == "CANCEL":
         await event.answer("Cancelled")
         selectable_parts.cleanup(uid)
+        selectable_parts.active.discard(uid)
         await event.respond("✅ Cancelled.")
         return
     if data.startswith("AUDIO:"):
@@ -162,7 +172,10 @@ async def part_manual(event):
         s["state"] = "ready"
         selectable_parts.locks[uid] = asyncio.Lock()
         await event.answer("Confirmed")
-        await event.edit(f"✅ Setup complete\n\n⬆️ {selectable_parts.part_title(s, 0)}\n⬇️ {s['footer']}\n\n👇 தேவையான Part-ஐ மட்டும் தேர்வு செய்யுங்கள்:", buttons=selectable_parts.all_keyboard(s["total"], s["duration"]))
+        await event.edit(
+            f"✅ Setup complete\n\n⬆️ {selectable_parts.part_title(s, 0)}\n⬇️ {s['footer']}\n\n👇 தேவையான Part-ஐ மட்டும் தேர்வு செய்யுங்கள்:",
+            buttons=selectable_parts.all_keyboard(s["total"], s["duration"]),
+        )
         return
     if data == "VIEWALL":
         if s.get("state") != "ready":
@@ -173,19 +186,24 @@ async def part_manual(event):
         return
     if not data.startswith("PART:"):
         return
-    await event.answer("⏳ Part தயாராகிறது...")
     if s.get("state") != "ready":
-        await event.respond("❌ முதலில் setup complete செய்யுங்கள்.")
+        await event.answer("முதலில் setup complete செய்யுங்கள்.")
         return
     try:
         i = int(data.split(":", 1)[1])
     except Exception:
+        await event.answer("Invalid part")
         return
     if i < 0 or i >= s["total"]:
+        await event.answer("Invalid part")
         return
+
+    # IMPORTANT: selecting a part is the only thing that starts encoding.
+    # No part is processed automatically after setup.
+    await event.answer("⏳ Part தயாராகிறது...")
     async with selectable_parts.locks[uid]:
         s = selectable_parts.sessions.get(uid)
-        if not s:
+        if not s or s.get("state") != "ready":
             return
         a = i * selectable_parts.CHUNK
         length = min(selectable_parts.CHUNK, s["duration"] - a)
@@ -193,8 +211,23 @@ async def part_manual(event):
         try:
             await event.edit(buttons=selectable_parts.next_keyboard(s["total"], s["duration"], i))
             await event.respond(f"⏳ {selectable_parts.part_title(s, i)} தயாராகிறது...\n🕐 {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}")
-            await asyncio.to_thread(make_part_compat, Path(s["source"]), Path(s["background"]), out, a, length, selectable_parts.part_title(s, i), s["footer"], s["audio_stream"])
-            await asyncio.to_thread(selectable_parts.send_part, uid, out, f"🎬 {selectable_parts.part_title(s, i)} • {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}")
+            await asyncio.to_thread(
+                make_part_compat,
+                Path(s["source"]),
+                Path(s["background"]),
+                out,
+                a,
+                length,
+                selectable_parts.part_title(s, i),
+                s["footer"],
+                s["audio_stream"],
+            )
+            await asyncio.to_thread(
+                selectable_parts.send_part,
+                uid,
+                out,
+                f"🎬 {selectable_parts.part_title(s, i)} • {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}",
+            )
             out.unlink(missing_ok=True)
             await event.edit(buttons=selectable_parts.next_keyboard(s["total"], s["duration"], i))
         except Exception as e:
@@ -207,7 +240,10 @@ async def main():
     selectable_parts.client.remove_event_handler(selectable_parts.video)
     selectable_parts.client.remove_event_handler(selectable_parts.part)
     selectable_parts.client.add_event_handler(video_manual, events.NewMessage(incoming=True))
-    selectable_parts.client.add_event_handler(part_manual, events.CallbackQuery(data=re.compile(rb"^(AUDIO:\d+|PART:\d+|VIEWALL|CANCEL|MODE:(SEASON|MOVIE)|FOOTER:(OK|CHANGE))$")))
+    selectable_parts.client.add_event_handler(
+        part_manual,
+        events.CallbackQuery(data=re.compile(rb"^(AUDIO:\d+|PART:\d+|VIEWALL|CANCEL|MODE:(SEASON|MOVIE)|FOOTER:(OK|CHANGE))$")),
+    )
     asyncio.create_task(asyncio.to_thread(selectable_parts.health))
     if selectable_parts.BOT_ROLE == "standby":
         while True:
