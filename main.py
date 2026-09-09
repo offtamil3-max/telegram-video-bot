@@ -83,6 +83,50 @@ def make_part_compat(src, bg, out, start, length, overlay_text, footer_text, aud
     subprocess.run(cmd, check=True, timeout=900)
 
 
+async def cancel_manual(event):
+    selectable_parts.cleanup(event.sender_id)
+    await event.respond("✅ Cancelled.")
+
+
+async def photo_manual(event):
+    uid, msg = event.sender_id, event.message
+    if not uid or not msg.photo:
+        return
+    if uid in selectable_parts.active:
+        await event.respond("⚠️ ஏற்கனவே ஒரு video processing-ல் உள்ளது. /cancel பயன்படுத்தவும்.")
+        return
+    old = selectable_parts.sessions.pop(uid, None)
+    if old:
+        shutil.rmtree(old.get("dir", ""), ignore_errors=True)
+    d = shutil.mkdtemp(prefix=f"video_{uid}_")
+    bg = Path(d) / "background.jpg"
+    try:
+        await selectable_parts.client.download_media(msg, file=str(bg))
+        selectable_parts.sessions[uid] = {"dir": d, "background": str(bg)}
+        await event.respond("✅ Background photo saved.\n\n🎬 இப்போது Video அனுப்புங்கள்.")
+    except Exception as e:
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"Photo prepare error for {uid}: {type(e).__name__}: {e}")
+        await event.respond("❌ Photo save செய்ய முடியவில்லை. மீண்டும் முயற்சி செய்யுங்கள்.")
+
+
+async def text_manual(event):
+    uid = event.sender_id
+    s = selectable_parts.sessions.get(uid)
+    if not s or s.get("state") != "awaiting_footer":
+        return
+    value = (event.raw_text or "").strip()
+    if not value:
+        await event.respond("✏️ கீழே வர வேண்டிய text-ஐ அனுப்புங்கள்.")
+        return
+    s["footer_pending"] = value[:180]
+    s["state"] = "confirm_footer"
+    await event.respond(
+        f"📝 கீழே வரும் text:\n\n{s['footer_pending']}\n\nஇதுதானா?",
+        buttons=selectable_parts.footer_confirm_keyboard(),
+    )
+
+
 async def video_manual(event):
     uid, msg = event.sender_id, event.message
     if not uid:
@@ -169,7 +213,10 @@ async def part_manual(event):
         s["state"] = "awaiting_footer"
         label = "MOVIE PART 1" if s["mode"] == "MOVIE" else "SEASON 1 EPISODE 1 PART 1"
         await event.answer("✅ Selected")
-        await event.edit(f"✅ Selected: {label}\n\n📝 இந்த video-வின் கீழே என்ன text வர வேண்டும்?\nText-ஐ ஒரு message-ஆ அனுப்புங்கள்.", buttons=[[Button.inline("🗑️ Cancel", data=b"CANCEL")]])
+        await event.edit(
+            f"✅ Selected: {label}\n\n📝 இந்த video-வின் கீழே என்ன text வர வேண்டும்?\nText-ஐ ஒரு message-ஆ அனுப்புங்கள்.",
+            buttons=[[Button.inline("🗑️ Cancel", data=b"CANCEL")]],
+        )
         return
     if data == "FOOTER:CHANGE":
         s["state"] = "awaiting_footer"
@@ -209,7 +256,6 @@ async def part_manual(event):
     if i < 0 or i >= s["total"]:
         await event.answer("Invalid part")
         return
-
     await event.answer("⏳ Part தயாராகிறது...")
     async with selectable_parts.locks[uid]:
         s = selectable_parts.sessions.get(uid)
@@ -247,22 +293,44 @@ async def part_manual(event):
 
 
 async def main():
-    # Remove older video/part handlers so this flow is the only processor.
-    selectable_parts.client.remove_event_handler(selectable_parts.video)
-    selectable_parts.client.remove_event_handler(selectable_parts.part)
-    selectable_parts.client.add_event_handler(video_manual, events.NewMessage(incoming=True))
-    selectable_parts.client.add_event_handler(
+    client = selectable_parts.client
+
+    # IMPORTANT: selectable_parts.py contains the legacy handlers. Remove ALL
+    # imported handlers before registering the new state-machine handlers.
+    # Keeping the old video handler was causing the automatic "PART 1" flow.
+    for callback, builder in list(client.list_event_handlers()):
+        client.remove_event_handler(callback, builder)
+
+    client.add_event_handler(
+        cancel_manual,
+        events.NewMessage(incoming=True, pattern=r"^/(?:reset|cancel)$"),
+    )
+    client.add_event_handler(
+        photo_manual,
+        events.NewMessage(incoming=True, func=lambda e: bool(e.message.photo)),
+    )
+    client.add_event_handler(
+        video_manual,
+        events.NewMessage(incoming=True),
+    )
+    client.add_event_handler(
+        text_manual,
+        events.NewMessage(incoming=True),
+    )
+    client.add_event_handler(
         part_manual,
         events.CallbackQuery(data=re.compile(rb"^(AUDIO:\d+|PART:\d+|VIEWALL|CANCEL|MODE:(SEASON|MOVIE)|FOOTER:(OK|CHANGE))$")),
     )
+
     asyncio.create_task(asyncio.to_thread(selectable_parts.health))
     if selectable_parts.BOT_ROLE == "standby":
         while True:
             await asyncio.sleep(86400)
-    await selectable_parts.client.start(bot_token=selectable_parts.BOT_TOKEN)
-    me = await selectable_parts.client.get_me()
+
+    await client.start(bot_token=selectable_parts.BOT_TOKEN)
+    me = await client.get_me()
     print(f"Bot connected: @{getattr(me, 'username', 'unknown')}")
-    await selectable_parts.client.run_until_disconnected()
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
