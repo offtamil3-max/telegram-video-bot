@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -17,6 +17,8 @@ CHUNK_SECONDS = 40
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
+if not LOCAL_BOT_API_URL:
+    raise RuntimeError("LOCAL_BOT_API_URL environment variable is required")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -57,29 +59,10 @@ def keyboard(has_next: bool):
     return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ அடுத்து", callback_data="NEXT")]])
 
 
-async def local_get_file_path(file_id: str) -> str:
-    if not LOCAL_BOT_API_URL:
-        raise RuntimeError("LOCAL_BOT_API_URL is not configured")
-    url = f"{LOCAL_BOT_API_URL}/bot{BOT_TOKEN}/getFile"
-    timeout = httpx.Timeout(connect=120.0, read=900.0, write=120.0, pool=120.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        response = await client.post(url, json={"file_id": file_id})
-        response.raise_for_status()
-        data = response.json()
-    if not data.get("ok") or not data.get("result", {}).get("file_path"):
-        raise RuntimeError(f"Local Bot API getFile failed: {data}")
-    return data["result"]["file_path"]
-
-
 async def download_local_file(file_path: str, destination: Path) -> None:
-    if not LOCAL_BOT_API_URL:
-        raise RuntimeError("LOCAL_BOT_API_URL is not configured")
-    if file_path.startswith(("http://", "https://")):
-        url = file_path
-    else:
-        relative_path = quote(file_path.lstrip("/"), safe="/")
-        url = f"{LOCAL_BOT_API_URL}/file/bot{BOT_TOKEN}/{relative_path}"
-    timeout = httpx.Timeout(connect=120.0, read=900.0, write=120.0, pool=120.0)
+    relative_path = quote(file_path.lstrip("/"), safe="/")
+    url = f"{LOCAL_BOT_API_URL}/file/bot{BOT_TOKEN}/{relative_path}"
+    timeout = httpx.Timeout(connect=120.0, read=1800.0, write=120.0, pool=120.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
@@ -146,14 +129,26 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("📥 Video download செய்கிறேன்...")
     try:
         file_id = msg.video.file_id if msg.video else msg.document.file_id
-        if LOCAL_BOT_API_URL:
-            file_path = await local_get_file_path(file_id)
-            await download_local_file(file_path, source)
-        else:
-            tg_file = await context.bot.get_file(
-                file_id, read_timeout=900, connect_timeout=120, write_timeout=120, pool_timeout=120,
+
+        # IMPORTANT: getFile must be called on the Local Bot API server.
+        # Telegram's hosted Bot API has a small download limit; the Local Bot API
+        # has access to the downloaded file in its own local storage.
+        local_bot = Bot(
+            token=BOT_TOKEN,
+            base_url=f"{LOCAL_BOT_API_URL}/bot",
+            base_file_url=f"{LOCAL_BOT_API_URL}/file/bot",
+        )
+        try:
+            tg_file = await local_bot.get_file(
+                file_id, read_timeout=120, connect_timeout=60, write_timeout=120, pool_timeout=60,
             )
-            await tg_file.download_to_drive(custom_path=str(source))
+        finally:
+            await local_bot.shutdown()
+
+        if not tg_file.file_path:
+            raise RuntimeError("Local Bot API returned no file path")
+
+        await download_local_file(tg_file.file_path, source)
 
         duration = await asyncio.to_thread(ffprobe_duration, source)
         total = max(1, int((duration + CHUNK_SECONDS - 1) // CHUNK_SECONDS))
@@ -168,7 +163,7 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Video processing failed")
         cleanup(user_id)
-        await msg.reply_text("❌ Video process செய்ய முடியவில்லை. Local Bot API connection அல்லது video download-ஐ சரிபார்க்க வேண்டும்.")
+        await msg.reply_text("❌ Video process செய்ய முடியவில்லை. Local Bot API download-ஐ சரிபார்க்க வேண்டும்.")
 
 
 async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -193,8 +188,6 @@ async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # Keep normal bot operations on the official Telegram API.
-    # Large-file getFile/download operations go directly to the Local Bot API.
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
