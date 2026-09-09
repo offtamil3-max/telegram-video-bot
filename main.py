@@ -9,12 +9,15 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import imageio_ffmpeg
 from telethon import TelegramClient, Button, events
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_ID = os.environ.get("TELEGRAM_API_ID")
 API_HASH = os.environ.get("TELEGRAM_API_HASH")
 CHUNK_SECONDS = 40
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+FFPROBE = FFMPEG.replace("ffmpeg", "ffprobe")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
@@ -49,7 +52,7 @@ def start_health_server():
 
 def ffprobe_duration(path: Path) -> float:
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+        [FFPROBE, "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
         capture_output=True, text=True, check=True, timeout=60,
     )
@@ -58,7 +61,7 @@ def ffprobe_duration(path: Path) -> float:
 
 def make_chunk(src: Path, dst: Path, start: float, duration: float) -> None:
     subprocess.run(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
          "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}",
          "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
          "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)],
@@ -138,8 +141,6 @@ async def video_handler(event):
     await event.respond("📥 Video download செய்கிறேன்...")
 
     try:
-        # Telethon uses Telegram's MTProto file transfer directly, avoiding the
-        # hosted Bot API file-download limit that caused the Railway failures.
         downloaded = await message.download_media(file=str(source))
         if not downloaded or not source.exists() or source.stat().st_size == 0:
             raise RuntimeError("Telegram media download failed")
@@ -191,7 +192,6 @@ async def next_handler(event):
 
 
 client = TelegramClient("telegram_video_bot", API_ID, API_HASH)
-
 client.add_event_handler(start_handler, events.NewMessage(pattern=r"^/start$", incoming=True))
 client.add_event_handler(cancel_handler, events.NewMessage(pattern=r"^/(cancel|reset)$", incoming=True))
 client.add_event_handler(video_handler, events.NewMessage(incoming=True))
