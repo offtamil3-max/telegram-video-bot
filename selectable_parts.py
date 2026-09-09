@@ -129,9 +129,15 @@ def part_title(s, i):
 
 
 def safe_draw_text(text):
-    # Keep user-supplied overlay text single-line and shell-safe for ffmpeg filter syntax.
     text = re.sub(r"[\r\n]+", " ", text).strip()
     return text[:180]
+
+
+def escape_drawtext(text):
+    return (safe_draw_text(text)
+            .replace("\\", "\\\\")
+            .replace(":", "\\:")
+            .replace("'", "\\'"))
 
 
 async def _download_range(message, dest, start, end, size, state):
@@ -202,8 +208,8 @@ async def download(message, dest, status):
 
 
 def make_part(src, bg, out, start, length, overlay_text, footer_text, audio_stream):
-    title = safe_draw_text(overlay_text).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-    footer = safe_draw_text(footer_text).replace("\\", "\\\\").replace("":", "\\:").replace("'", "\\'")
+    title = escape_drawtext(overlay_text)
+    footer = escape_drawtext(footer_text)
     filter_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:1[bg];"
         "[1:v]scale=1000:1780:force_original_aspect_ratio=decrease[fg];"
