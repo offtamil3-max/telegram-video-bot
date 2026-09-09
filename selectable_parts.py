@@ -106,6 +106,34 @@ def next_keyboard(total, dur, current):
     return rows
 
 
+def mode_keyboard():
+    return [
+        [Button.inline("📺 Season / Episode", data=b"MODE:SEASON")],
+        [Button.inline("🎬 Movie", data=b"MODE:MOVIE")],
+        [Button.inline("🗑️ Cancel", data=b"CANCEL")],
+    ]
+
+
+def footer_confirm_keyboard():
+    return [
+        [Button.inline("✅ Confirm", data=b"FOOTER:OK"), Button.inline("✏️ Change", data=b"FOOTER:CHANGE")],
+        [Button.inline("🗑️ Cancel", data=b"CANCEL")],
+    ]
+
+
+def part_title(s, i):
+    n = i + 1
+    if s.get("mode") == "MOVIE":
+        return f"MOVIE PART {n}"
+    return f"SEASON {s.get('season', 1)} EPISODE {s.get('episode', 1)} PART {n}"
+
+
+def safe_draw_text(text):
+    # Keep user-supplied overlay text single-line and shell-safe for ffmpeg filter syntax.
+    text = re.sub(r"[\r\n]+", " ", text).strip()
+    return text[:180]
+
+
 async def _download_range(message, dest, start, end, size, state):
     chunk_count = math.ceil((end - start) / DOWNLOAD_REQUEST)
     written = 0
@@ -173,13 +201,24 @@ async def download(message, dest, status):
     await status.edit(f"✅ Full video downloaded\n{size / 1024 / 1024:.1f} MB • {size / elapsed / 1024 / 1024:.2f} MB/s\n🚀 {DOWNLOAD_WORKERS} parallel Telegram streams")
 
 
-def make_part(src, out, start, length, audio_stream):
+def make_part(src, bg, out, start, length, overlay_text, footer_text, audio_stream):
+    title = safe_draw_text(overlay_text).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    footer = safe_draw_text(footer_text).replace("\\", "\\\\").replace("":", "\\:").replace("'", "\\'")
+    filter_complex = (
+        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:1[bg];"
+        "[1:v]scale=1000:1780:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2[base];"
+        f"[base]drawtext=text='{title}':fontcolor=white:fontsize=58:box=1:boxcolor=black@0.65:boxborderw=18:x=(w-text_w)/2:y=45,"
+        f"drawtext=text='{footer}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.65:boxborderw=14:x=(w-text_w)/2:y=h-text_h-55[v]"
+    )
     subprocess.run([
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-loop", "1", "-i", str(bg),
         "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{length:.3f}",
-        "-map", "0:v:0", "-map", f"0:{audio_stream}",
+        "-filter_complex", filter_complex,
+        "-map", "[v]", "-map", f"1:{audio_stream}",
         "-sn", "-dn", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-        "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)
+        "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", str(out)
     ], check=True, timeout=900)
 
 
@@ -202,12 +241,48 @@ def cleanup(uid):
 
 
 async def start(event):
-    await event.respond("🎬 40-Second Video Splitter\n\nVideo அனுப்புங்கள். Full video download ஆனதும் Part buttons வரும். நீங்கள் தேர்வு செய்யும் Part மட்டும் உருவாக்கி அனுப்பப்படும்.")
+    await event.respond("🎬 40-Second Video Splitter\n\n1️⃣ முதலில் Background Photo அனுப்புங்கள்.\n2️⃣ அடுத்து Video அனுப்புங்கள்.\n3️⃣ Season / Episode அல்லது Movie தேர்வு செய்யுங்கள்.\n4️⃣ கீழே வர வேண்டிய custom text-ஐ அனுப்பி Confirm செய்யுங்கள்.\n5️⃣ தேவையான Part-ஐ மட்டும் தேர்வு செய்யுங்கள்.")
 
 
 async def cancel(event):
     cleanup(event.sender_id)
     await event.respond("✅ Cancelled.")
+
+
+async def photo(event):
+    uid, msg = event.sender_id, event.message
+    if not uid or not msg.photo:
+        return
+    if uid in active:
+        await event.respond("⚠️ ஏற்கனவே ஒரு video processing-ல் உள்ளது. /cancel பயன்படுத்தவும்.")
+        return
+    old = sessions.pop(uid, None)
+    if old:
+        shutil.rmtree(old.get("dir", ""), ignore_errors=True)
+    d = tempfile.mkdtemp(prefix=f"video_{uid}_")
+    bg = Path(d) / "background.jpg"
+    try:
+        await client.download_media(msg, file=str(bg))
+        sessions[uid] = {"dir": d, "background": str(bg)}
+        await event.respond("✅ Background photo saved.\n\n🎬 இப்போது Video அனுப்புங்கள்.")
+    except Exception as e:
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"Photo prepare error for {uid}: {type(e).__name__}: {e}")
+        await event.respond("❌ Photo save செய்ய முடியவில்லை. மீண்டும் முயற்சி செய்யுங்கள்.")
+
+
+async def text(event):
+    uid = event.sender_id
+    s = sessions.get(uid)
+    if not s or s.get("state") != "awaiting_footer":
+        return
+    value = (event.raw_text or "").strip()
+    if not value:
+        await event.respond("✏️ கீழே வர வேண்டிய text-ஐ அனுப்புங்கள்.")
+        return
+    s["footer_pending"] = value[:180]
+    s["state"] = "confirm_footer"
+    await event.respond(f"📝 கீழே வரும் text:\n\n{s['footer_pending']}\n\nஇதுதானா?", buttons=footer_confirm_keyboard())
 
 
 async def video(event):
@@ -219,19 +294,28 @@ async def video(event):
     mime = getattr(msg.file, "mime_type", None) if msg.file else None
     if not mime or not mime.startswith("video/"):
         return
+    s = sessions.get(uid)
+    if not s or not s.get("background"):
+        await event.respond("🖼️ முதலில் Background Photo அனுப்புங்கள்.")
+        return
     active.add(uid)
-    d = tempfile.mkdtemp(prefix=f"video_{uid}_")
+    d = s["dir"]
     src = Path(d) / "video.mp4"
-    sessions[uid] = {"dir": d}
     status = await event.respond("📥 Full video download தொடங்குகிறது...\n0%")
     try:
         await download(msg, src, status)
         dur = await asyncio.to_thread(duration, src)
         audio_stream = await asyncio.to_thread(find_tamil_audio, src)
         total = max(1, math.ceil(dur / CHUNK))
-        sessions[uid] = {"dir": d, "source": str(src), "duration": dur, "total": total, "audio_stream": audio_stream}
-        locks[uid] = asyncio.Lock()
-        await event.respond(f"✅ Full video ready\n\n⏱️ Duration: {ts(dur)}\n🎧 Tamil audio selected\n🎬 Total parts: {total}\n\n👇 தேவையான Part-ஐ மட்டும் தேர்வு செய்யுங்கள்:", buttons=all_keyboard(total, dur))
+        sessions[uid] = {
+            "dir": d, "background": s["background"], "source": str(src),
+            "duration": dur, "total": total, "audio_stream": audio_stream,
+            "state": "choose_mode"
+        }
+        await event.respond(
+            f"✅ Full video ready\n\n⏱️ Duration: {ts(dur)}\n🎧 Tamil audio selected\n🎬 Total parts: {total}\n\n👇 மேலே வர வேண்டிய label-ஐ தேர்வு செய்யுங்கள்:",
+            buttons=mode_keyboard()
+        )
     except Exception as e:
         cleanup(uid)
         print(f"Video prepare error for {uid}: {type(e).__name__}: {e}")
@@ -239,19 +323,59 @@ async def video(event):
 
 
 async def part(event):
-    await event.answer("⏳ Part தயாராகிறது...")
     uid = event.sender_id
-    s = sessions.get(uid)
-    if not s or "duration" not in s:
-        await event.respond("❌ Active video இல்லை.")
-        return
     data = event.data.decode()
+    s = sessions.get(uid)
+    if not s:
+        await event.answer("❌ Active video இல்லை.")
+        return
     if data == "CANCEL":
+        await event.answer("Cancelled")
         cleanup(uid)
         await event.respond("✅ Cancelled.")
         return
+    if data.startswith("MODE:"):
+        if s.get("state") != "choose_mode":
+            await event.answer("இந்த video-க்கு mode ஏற்கனவே தேர்வு செய்யப்பட்டது.")
+            return
+        s["mode"] = data.split(":", 1)[1]
+        s["season"] = 1
+        s["episode"] = 1
+        s["state"] = "awaiting_footer"
+        label = "MOVIE PART 1" if s["mode"] == "MOVIE" else "SEASON 1 EPISODE 1 PART 1"
+        await event.answer("✅ Selected")
+        await event.edit(f"✅ Selected: {label}\n\n📝 இந்த video-வின் கீழே என்ன text வர வேண்டும்?\nText-ஐ ஒரு message-ஆ அனுப்புங்கள்.", buttons=[[Button.inline("🗑️ Cancel", data=b"CANCEL")]])
+        return
+    if data == "FOOTER:CHANGE":
+        s["state"] = "awaiting_footer"
+        await event.answer("Change")
+        await event.edit("✏️ புதிய கீழ் text-ஐ அனுப்புங்கள்.", buttons=[[Button.inline("🗑️ Cancel", data=b"CANCEL")]])
+        return
+    if data == "FOOTER:OK":
+        if s.get("state") != "confirm_footer":
+            await event.answer("முதலில் text அனுப்புங்கள்.")
+            return
+        s["footer"] = s.pop("footer_pending")
+        s["state"] = "ready"
+        locks[uid] = asyncio.Lock()
+        await event.answer("Confirmed")
+        await event.edit(
+            f"✅ Setup complete\n\n⬆️ {part_title(s, 0)}\n⬇️ {s['footer']}\n\n👇 தேவையான Part-ஐ மட்டும் தேர்வு செய்யுங்கள்:",
+            buttons=all_keyboard(s["total"], s["duration"])
+        )
+        return
     if data == "VIEWALL":
+        if s.get("state") != "ready":
+            await event.answer("முதலில் setup முடிக்கவும்.")
+            return
+        await event.answer("All parts")
         await event.edit(buttons=all_keyboard(s["total"], s["duration"]))
+        return
+    if not data.startswith("PART:"):
+        return
+    await event.answer("⏳ Part தயாராகிறது...")
+    if s.get("state") != "ready":
+        await event.respond("❌ முதலில் setup complete செய்யுங்கள்.")
         return
     try:
         i = int(data.split(":")[1])
@@ -268,9 +392,9 @@ async def part(event):
         out = Path(s["dir"]) / f"part_{i + 1}.mp4"
         try:
             await event.edit(buttons=next_keyboard(s["total"], s["duration"], i))
-            await event.respond(f"⏳ Part {i + 1}/{s['total']} தயாராகிறது...\n🕐 {ts(a)} → {ts(a + length)}")
-            await asyncio.to_thread(make_part, Path(s["source"]), out, a, length, s["audio_stream"])
-            await asyncio.to_thread(send_part, uid, out, f"🎬 Part {i + 1}/{s['total']} • {ts(a)} → {ts(a + length)}")
+            await event.respond(f"⏳ {part_title(s, i)} தயாராகிறது...\n🕐 {ts(a)} → {ts(a + length)}")
+            await asyncio.to_thread(make_part, Path(s["source"]), Path(s["background"]), out, a, length, part_title(s, i), s["footer"], s["audio_stream"])
+            await asyncio.to_thread(send_part, uid, out, f"🎬 {part_title(s, i)} • {ts(a)} → {ts(a + length)}")
             out.unlink(missing_ok=True)
             await event.edit(buttons=next_keyboard(s["total"], s["duration"], i))
         except Exception as e:
@@ -282,8 +406,10 @@ async def part(event):
 client = TelegramClient("telegram_video_bot", API_ID, API_HASH)
 client.add_event_handler(start, events.NewMessage(pattern=r"^/start$", incoming=True))
 client.add_event_handler(cancel, events.NewMessage(pattern=r"^/(cancel|reset)$", incoming=True))
+client.add_event_handler(photo, events.NewMessage(incoming=True))
+client.add_event_handler(text, events.NewMessage(incoming=True))
 client.add_event_handler(video, events.NewMessage(incoming=True))
-client.add_event_handler(part, events.CallbackQuery(data=re.compile(rb"^(PART:\d+|VIEWALL|CANCEL)$")))
+client.add_event_handler(part, events.CallbackQuery(data=re.compile(rb"^(PART:\d+|VIEWALL|CANCEL|MODE:(SEASON|MOVIE)|FOOTER:(OK|CHANGE))$")))
 
 
 async def main():
