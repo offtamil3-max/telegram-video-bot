@@ -7,8 +7,8 @@ from pathlib import Path
 import selectable_parts
 from telethon import Button, events
 
-# The Docker image installs Debian's FFmpeg. Use it when available because the
-# imageio bundled binary may not include libavfilter drawtext support.
+# Prefer Render/system FFmpeg because it has the drawtext filter required by the
+# vertical compositor. Fall back to imageio-ffmpeg where system FFmpeg is absent.
 SYSTEM_FFMPEG = shutil.which("ffmpeg")
 if SYSTEM_FFMPEG:
     selectable_parts.FFMPEG = SYSTEM_FFMPEG
@@ -60,17 +60,21 @@ def make_part_compat(src, bg, out, start, length, overlay_text, footer_text, aud
         f"[base]drawtext=text='{title}':fontcolor=white:fontsize=58:box=1:boxcolor=black@0.65:boxborderw=18:x=(w-text_w)/2:y=45,"
         f"drawtext=text='{footer}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.65:boxborderw=14:x=(w-text_w)/2:y=h-text_h-55[v]"
     )
-    subprocess.run([
+    # Render's free instance has a 512 MiB memory ceiling. Limit both x264 and
+    # libavfilter threading so a single 1080x1920 encode cannot exhaust it.
+    cmd = [
         selectable_parts.FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
         "-loop", "1", "-i", str(bg),
         "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{length:.3f}",
         "-filter_complex", filt,
         "-map", "[v]", "-map", f"1:{audio_stream}", "-sn", "-dn",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
         "-pix_fmt", "yuv420p", "-profile:v", "high", "-level:v", "4.0",
-        "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
-        "-movflags", "+faststart", str(out)
-    ], check=True, timeout=900)
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart", str(out),
+    ]
+    subprocess.run(cmd, check=True, timeout=900)
 
 
 async def video_manual(event):
