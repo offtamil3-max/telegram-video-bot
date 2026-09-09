@@ -49,7 +49,6 @@ def audio_keyboard(tracks):
 
 
 def prepare_background(src, out):
-    """Create the blurred 1080x1920 background once, not on every Part encode."""
     cmd = [
         selectable_parts.FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
         "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
@@ -118,16 +117,19 @@ async def video_manual(event):
             "audio_tracks": tracks,
             "state": "choose_audio",
         }
-        selectable_parts.active.discard(uid)
-        await event.respond(
+        await status.edit(
             f"✅ Full video ready\n\n⏱️ Duration: {selectable_parts.ts(dur)}\n🎧 Audio tracks: {len(tracks)}\n\n👇 File-ல் இருக்கும் audio track name அப்படியே தேர்வு செய்யுங்கள்:",
             buttons=audio_keyboard(tracks),
         )
     except Exception as e:
-        selectable_parts.active.discard(uid)
         selectable_parts.cleanup(uid)
         print(f"Video prepare error for {uid}: {type(e).__name__}: {e}")
-        await event.respond("❌ Video prepare செய்ய முடியவில்லை. மீண்டும் முயற்சி செய்யுங்கள்.")
+        try:
+            await status.edit("❌ Video prepare செய்ய முடியவில்லை. மீண்டும் முயற்சி செய்யுங்கள்.")
+        except Exception:
+            await event.respond("❌ Video prepare செய்ய முடியவில்லை. மீண்டும் முயற்சி செய்யுங்கள்.")
+    finally:
+        selectable_parts.active.discard(uid)
 
 
 async def part_manual(event):
@@ -140,7 +142,6 @@ async def part_manual(event):
     if data == "CANCEL":
         await event.answer("Cancelled")
         selectable_parts.cleanup(uid)
-        selectable_parts.active.discard(uid)
         await event.respond("✅ Cancelled.")
         return
     if data.startswith("AUDIO:"):
@@ -219,27 +220,24 @@ async def part_manual(event):
         out = Path(s["dir"]) / f"part_{i + 1}.mp4"
         selectable_parts.active.add(uid)
         try:
-            await event.edit(buttons=selectable_parts.next_keyboard(s["total"], s["duration"], i))
-            await event.respond(f"⏳ {selectable_parts.part_title(s, i)} தயாராகிறது...\n🕐 {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}")
+            await event.edit(
+                f"⏳ {selectable_parts.part_title(s, i)} தயாராகிறது...\n🕐 {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}"
+            )
             await asyncio.to_thread(
                 make_part_compat,
-                Path(s["source"]),
-                Path(s["background"]),
-                out,
-                a,
-                length,
-                selectable_parts.part_title(s, i),
-                s["footer"],
-                s["audio_stream"],
+                Path(s["source"]), Path(s["background"]), out,
+                a, length, selectable_parts.part_title(s, i), s["footer"], s["audio_stream"],
             )
             await asyncio.to_thread(
                 selectable_parts.send_part,
-                uid,
-                out,
+                uid, out,
                 f"🎬 {selectable_parts.part_title(s, i)} • {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}",
             )
             out.unlink(missing_ok=True)
-            await event.edit(buttons=selectable_parts.next_keyboard(s["total"], s["duration"], i))
+            await event.edit(
+                f"✅ {selectable_parts.part_title(s, i)} sent\n\n👇 அடுத்த Part-ஐ தேர்வு செய்யுங்கள்:",
+                buttons=selectable_parts.next_keyboard(s["total"], s["duration"], i),
+            )
         except Exception as e:
             out.unlink(missing_ok=True)
             print(f"Part error for {uid}: {type(e).__name__}: {e}")
@@ -249,6 +247,7 @@ async def part_manual(event):
 
 
 async def main():
+    # Remove older video/part handlers so this flow is the only processor.
     selectable_parts.client.remove_event_handler(selectable_parts.video)
     selectable_parts.client.remove_event_handler(selectable_parts.part)
     selectable_parts.client.add_event_handler(video_manual, events.NewMessage(incoming=True))
