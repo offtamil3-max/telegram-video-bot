@@ -1,10 +1,15 @@
 import asyncio
+import math
+import os
 import re
 import subprocess
 from pathlib import Path
 
 import selectable_parts
 from telethon import Button, events
+
+
+RENDER_FFMPEG = "/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else selectable_parts.FFMPEG
 
 
 def list_audio_tracks(path):
@@ -38,9 +43,8 @@ def list_audio_tracks(path):
     if not tracks:
         raise RuntimeError("No audio track found")
 
-    # Prefer the file's explicit track title. If there is no title, show the
-    # language metadata exactly as stored. If neither exists, the button is
-    # visually empty (zero-width space) and no artificial name is added.
+    # Use only metadata actually stored in the file. Never invent a language
+    # or track name. If both are absent, keep the button visually blank.
     for t in tracks:
         t["label"] = t["title"] if t["title"] != "" else t["lang"]
         if t["label"] == "":
@@ -52,12 +56,7 @@ def list_audio_tracks(path):
 def audio_keyboard(tracks):
     rows = []
     for i, t in enumerate(tracks):
-        rows.append([
-            Button.inline(
-                t["label"],
-                data=f"AUDIO:{i}".encode(),
-            )
-        ])
+        rows.append([Button.inline(t["label"], data=f"AUDIO:{i}".encode())])
     rows.append([Button.inline("🗑️ Cancel", data=b"CANCEL")])
     return rows
 
@@ -77,7 +76,7 @@ def make_part_compat(src, bg, out, start, length, overlay_text, footer_text, aud
         f"drawtext=text='{footer}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.65:boxborderw=14:x=(w-text_w)/2:y=h-text_h-55[v]"
     )
     subprocess.run([
-        selectable_parts.FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        RENDER_FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
         "-loop", "1", "-i", str(bg),
         "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{length:.3f}",
         "-filter_complex", filt,
@@ -113,14 +112,10 @@ async def video_manual(event):
         await selectable_parts.download(msg, src, status)
         dur = await asyncio.to_thread(selectable_parts.duration, src)
         tracks = await asyncio.to_thread(list_audio_tracks, src)
-        total = max(1, __import__("math").ceil(dur / selectable_parts.CHUNK))
+        total = max(1, math.ceil(dur / selectable_parts.CHUNK))
         selectable_parts.sessions[uid] = {
-            "dir": d,
-            "background": s["background"],
-            "source": str(src),
-            "duration": dur,
-            "total": total,
-            "audio_tracks": tracks,
+            "dir": d, "background": s["background"], "source": str(src),
+            "duration": dur, "total": total, "audio_tracks": tracks,
             "state": "choose_audio",
         }
         await event.respond(
@@ -161,11 +156,7 @@ async def part_manual(event):
         s["audio_label"] = track["label"]
         s["state"] = "choose_mode"
         await event.answer("✅ Audio selected")
-        await event.edit(
-            "✅ Audio track selected.\n\n"
-            "👇 இப்போது மேலே வர வேண்டிய label-ஐ தேர்வு செய்யுங்கள்:",
-            buttons=selectable_parts.mode_keyboard(),
-        )
+        await event.edit("✅ Audio track selected.\n\n👇 இப்போது மேலே வர வேண்டிய label-ஐ தேர்வு செய்யுங்கள்:", buttons=selectable_parts.mode_keyboard())
         return
 
     if data.startswith("MODE:"):
@@ -234,18 +225,13 @@ async def part_manual(event):
         out = Path(s["dir"]) / f"part_{i + 1}.mp4"
         try:
             await event.edit(buttons=selectable_parts.next_keyboard(s["total"], s["duration"], i))
-            await event.respond(
-                f"⏳ {selectable_parts.part_title(s, i)} தயாராகிறது...\n🕐 {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}"
+            await event.respond(f"⏳ {selectable_parts.part_title(s, i)} தயாராகிறது...\n🕐 {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}")
+            await asyncio.to_thread(
+                make_part_compat, Path(s["source"]), Path(s["background"]), out,
+                a, length, selectable_parts.part_title(s, i), s["footer"], s["audio_stream"]
             )
             await asyncio.to_thread(
-                make_part_compat,
-                Path(s["source"]), Path(s["background"]), out,
-                a, length, selectable_parts.part_title(s, i),
-                s["footer"], s["audio_stream"],
-            )
-            await asyncio.to_thread(
-                selectable_parts.send_part,
-                uid, out,
+                selectable_parts.send_part, uid, out,
                 f"🎬 {selectable_parts.part_title(s, i)} • {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}",
             )
             out.unlink(missing_ok=True)
@@ -257,20 +243,12 @@ async def part_manual(event):
 
 
 async def main():
-    # selectable_parts registers the old auto-Tamil handlers at import time.
-    # Remove those two handlers and install the manual audio-selection flow.
     selectable_parts.client.remove_event_handler(selectable_parts.video)
     selectable_parts.client.remove_event_handler(selectable_parts.part)
-    selectable_parts.client.add_event_handler(
-        video_manual, events.NewMessage(incoming=True)
-    )
+    selectable_parts.client.add_event_handler(video_manual, events.NewMessage(incoming=True))
     selectable_parts.client.add_event_handler(
         part_manual,
-        events.CallbackQuery(
-            data=re.compile(
-                rb"^(AUDIO:\d+|PART:\d+|VIEWALL|CANCEL|MODE:(SEASON|MOVIE)|FOOTER:(OK|CHANGE))$"
-            )
-        ),
+        events.CallbackQuery(data=re.compile(rb"^(AUDIO:\d+|PART:\d+|VIEWALL|CANCEL|MODE:(SEASON|MOVIE)|FOOTER:(OK|CHANGE))$")),
     )
     asyncio.create_task(asyncio.to_thread(selectable_parts.health))
     if selectable_parts.BOT_ROLE == "standby":
