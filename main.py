@@ -1,4 +1,5 @@
 import asyncio
+import math
 import re
 import shutil
 import subprocess
@@ -47,20 +48,31 @@ def audio_keyboard(tracks):
     return rows
 
 
+def prepare_background(src, out):
+    """Create the blurred 1080x1920 background once, not on every Part encode."""
+    cmd = [
+        selectable_parts.FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+        "-i", str(src),
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:1",
+        "-frames:v", "1", "-q:v", "5", str(out),
+    ]
+    subprocess.run(cmd, check=True, timeout=120)
+
+
 def make_part_compat(src, bg, out, start, length, overlay_text, footer_text, audio_stream):
     title = selectable_parts.escape_drawtext(overlay_text)
     footer = selectable_parts.escape_drawtext(footer_text)
     filt = (
-        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:1[bg];"
         "[1:v]scale=1000:1780:force_original_aspect_ratio=decrease[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2[base];"
+        "[0:v][fg]overlay=(W-w)/2:(H-h)/2[base];"
         f"[base]drawtext=text='{title}':fontcolor=white:fontsize=58:box=1:boxcolor=black@0.65:boxborderw=18:x=(w-text_w)/2:y=45,"
         f"drawtext=text='{footer}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.65:boxborderw=14:x=(w-text_w)/2:y=h-text_h-55[v]"
     )
     cmd = [
         selectable_parts.FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
         "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
-        "-loop", "1", "-i", str(bg),
+        "-loop", "1", "-framerate", "30", "-i", str(bg),
         "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{length:.3f}",
         "-filter_complex", filt,
         "-map", "[v]", "-map", f"1:{audio_stream}", "-sn", "-dn",
@@ -89,24 +101,23 @@ async def video_manual(event):
     selectable_parts.active.add(uid)
     d = s["dir"]
     src = Path(d) / "video.mp4"
+    bg_blur = Path(d) / "background_blur.jpg"
     status = await event.respond("📥 Full video download தொடங்குகிறது...\n0%")
     try:
         await selectable_parts.download(msg, src, status)
         dur = await asyncio.to_thread(selectable_parts.duration, src)
         tracks = await asyncio.to_thread(list_audio_tracks, src)
-        total = max(1, __import__("math").ceil(dur / selectable_parts.CHUNK))
+        await asyncio.to_thread(prepare_background, Path(s["background"]), bg_blur)
+        total = max(1, math.ceil(dur / selectable_parts.CHUNK))
         selectable_parts.sessions[uid] = {
             "dir": d,
-            "background": s["background"],
+            "background": str(bg_blur),
             "source": str(src),
             "duration": dur,
             "total": total,
             "audio_tracks": tracks,
             "state": "choose_audio",
         }
-        # Full-video preparation is finished. Do not keep the user in the
-        # global processing state, otherwise later messages trigger a false
-        # "already processing" warning.
         selectable_parts.active.discard(uid)
         await event.respond(
             f"✅ Full video ready\n\n⏱️ Duration: {selectable_parts.ts(dur)}\n🎧 Audio tracks: {len(tracks)}\n\n👇 File-ல் இருக்கும் audio track name அப்படியே தேர்வு செய்யுங்கள்:",
@@ -198,8 +209,6 @@ async def part_manual(event):
         await event.answer("Invalid part")
         return
 
-    # IMPORTANT: selecting a part is the only thing that starts encoding.
-    # No part is processed automatically after setup.
     await event.answer("⏳ Part தயாராகிறது...")
     async with selectable_parts.locks[uid]:
         s = selectable_parts.sessions.get(uid)
@@ -208,6 +217,7 @@ async def part_manual(event):
         a = i * selectable_parts.CHUNK
         length = min(selectable_parts.CHUNK, s["duration"] - a)
         out = Path(s["dir"]) / f"part_{i + 1}.mp4"
+        selectable_parts.active.add(uid)
         try:
             await event.edit(buttons=selectable_parts.next_keyboard(s["total"], s["duration"], i))
             await event.respond(f"⏳ {selectable_parts.part_title(s, i)} தயாராகிறது...\n🕐 {selectable_parts.ts(a)} → {selectable_parts.ts(a + length)}")
@@ -234,6 +244,8 @@ async def part_manual(event):
             out.unlink(missing_ok=True)
             print(f"Part error for {uid}: {type(e).__name__}: {e}")
             await event.respond("❌ Part அனுப்ப முடியவில்லை. மீண்டும் முயற்சி செய்யுங்கள்.")
+        finally:
+            selectable_parts.active.discard(uid)
 
 
 async def main():
