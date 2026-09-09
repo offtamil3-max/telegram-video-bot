@@ -60,9 +60,12 @@ def keyboard(has_next: bool):
 async def download_local_file(file_path: str, destination: Path) -> None:
     if not LOCAL_BOT_API_URL:
         raise RuntimeError("LOCAL_BOT_API_URL is not configured")
-    relative_path = quote(file_path.lstrip("/"), safe="/")
-    url = f"{LOCAL_BOT_API_URL}/file/bot{BOT_TOKEN}/{relative_path}"
-    timeout = httpx.Timeout(connect=60.0, read=None, write=60.0, pool=60.0)
+    if file_path.startswith(("http://", "https://")):
+        url = file_path
+    else:
+        relative_path = quote(file_path.lstrip("/"), safe="/")
+        url = f"{LOCAL_BOT_API_URL}/file/bot{BOT_TOKEN}/{relative_path}"
+    timeout = httpx.Timeout(connect=120.0, read=900.0, write=120.0, pool=120.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
@@ -129,7 +132,9 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("📥 Video download செய்கிறேன்...")
     try:
         file_id = msg.video.file_id if msg.video else msg.document.file_id
-        tg_file = await context.bot.get_file(file_id)
+        tg_file = await context.bot.get_file(
+            file_id, read_timeout=900, connect_timeout=120, write_timeout=120, pool_timeout=120,
+        )
         if LOCAL_BOT_API_URL and tg_file.file_path:
             await download_local_file(tg_file.file_path, source)
         else:
