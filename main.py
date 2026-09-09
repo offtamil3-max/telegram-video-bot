@@ -57,6 +57,20 @@ def keyboard(has_next: bool):
     return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ அடுத்து", callback_data="NEXT")]])
 
 
+async def local_get_file_path(file_id: str) -> str:
+    if not LOCAL_BOT_API_URL:
+        raise RuntimeError("LOCAL_BOT_API_URL is not configured")
+    url = f"{LOCAL_BOT_API_URL}/bot{BOT_TOKEN}/getFile"
+    timeout = httpx.Timeout(connect=120.0, read=900.0, write=120.0, pool=120.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.post(url, json={"file_id": file_id})
+        response.raise_for_status()
+        data = response.json()
+    if not data.get("ok") or not data.get("result", {}).get("file_path"):
+        raise RuntimeError(f"Local Bot API getFile failed: {data}")
+    return data["result"]["file_path"]
+
+
 async def download_local_file(file_path: str, destination: Path) -> None:
     if not LOCAL_BOT_API_URL:
         raise RuntimeError("LOCAL_BOT_API_URL is not configured")
@@ -132,12 +146,13 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("📥 Video download செய்கிறேன்...")
     try:
         file_id = msg.video.file_id if msg.video else msg.document.file_id
-        tg_file = await context.bot.get_file(
-            file_id, read_timeout=900, connect_timeout=120, write_timeout=120, pool_timeout=120,
-        )
-        if LOCAL_BOT_API_URL and tg_file.file_path:
-            await download_local_file(tg_file.file_path, source)
+        if LOCAL_BOT_API_URL:
+            file_path = await local_get_file_path(file_id)
+            await download_local_file(file_path, source)
         else:
+            tg_file = await context.bot.get_file(
+                file_id, read_timeout=900, connect_timeout=120, write_timeout=120, pool_timeout=120,
+            )
             await tg_file.download_to_drive(custom_path=str(source))
 
         duration = await asyncio.to_thread(ffprobe_duration, source)
@@ -178,8 +193,8 @@ async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # Use the official Telegram Bot API for normal bot operations.
-    # Use the Local Bot API only for downloading the large file from its local storage.
+    # Keep normal bot operations on the official Telegram API.
+    # Large-file getFile/download operations go directly to the Local Bot API.
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
