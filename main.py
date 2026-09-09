@@ -79,36 +79,63 @@ def ffprobe_duration(path: Path) -> float:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
-async def fast_download(message, destination: Path) -> None:
-    media = message.media
+async def fast_download(message, destination: Path, status_message) -> None:
     file_size = getattr(message.file, "size", None)
-
-    if not media or not file_size:
+    if not message.media or not file_size:
         raise RuntimeError("Telegram media/file size is unavailable")
 
     logger.info(
-        "Fast download started: %.1f MB using %d KB requests",
+        "Fast download started: %.1f MB using Telegram request size %d KB",
         file_size / 1024 / 1024,
         DOWNLOAD_REQUEST_SIZE // 1024,
     )
 
+    progress = {"current": 0}
     started = time.monotonic()
-    written = 0
 
-    with destination.open("wb") as out:
-        async for chunk in client.iter_download(
-            media,
-            offset=0,
-            stride=DOWNLOAD_REQUEST_SIZE,
-            limit=None,
-            chunk_size=DOWNLOAD_REQUEST_SIZE,
-            request_size=DOWNLOAD_REQUEST_SIZE,
-            file_size=file_size,
-        ):
-            out.write(chunk)
-            written += len(chunk)
+    def progress_callback(current, total):
+        progress["current"] = current
+
+    async def progress_loop():
+        last_text = ""
+        while True:
+            await asyncio.sleep(2)
+            current = progress["current"]
+            total = file_size or 1
+            pct = min(100.0, current * 100.0 / total)
+            elapsed = max(time.monotonic() - started, 0.1)
+            speed = current / elapsed / 1024 / 1024
+            remaining = max(total - current, 0)
+            eta = remaining / max(speed * 1024 * 1024, 1)
+            eta_text = f"~{int(eta)}s" if current else "..."
+            text = (
+                f"📥 Video download: {pct:.0f}%\n"
+                f"{current / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB\n"
+                f"⚡ {speed:.2f} MB/s • ETA {eta_text}"
+            )
+            if text != last_text:
+                try:
+                    await status_message.edit(text)
+                    last_text = text
+                except Exception:
+                    pass
+
+    progress_task = asyncio.create_task(progress_loop())
+    try:
+        await client.download_media(
+            message,
+            file=str(destination),
+            progress_callback=progress_callback,
+        )
+    finally:
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
 
     elapsed = time.monotonic() - started
+    written = destination.stat().st_size if destination.exists() else 0
     speed = written / max(elapsed, 0.001) / 1024 / 1024
     logger.info(
         "Fast download complete: %.1f MB in %.1fs (%.2f MB/s)",
@@ -116,6 +143,12 @@ async def fast_download(message, destination: Path) -> None:
         elapsed,
         speed,
     )
+    try:
+        await status_message.edit(
+            f"✅ Download முடிந்தது — {written / 1024 / 1024:.1f} MB in {elapsed:.1f}s"
+        )
+    except Exception:
+        pass
 
 
 def make_chunk(src: Path, dst: Path, start: float, duration: float) -> None:
@@ -320,10 +353,10 @@ async def video_handler(event):
     source = Path(temp_dir) / "video.mp4"
     sessions[user_id] = {"dir": temp_dir}
 
-    await event.respond("📥 Video download செய்கிறேன்...")
+    download_status = await event.respond("📥 Video download தொடங்குகிறது...\n0%")
 
     try:
-        await fast_download(message, source)
+        await fast_download(message, source, download_status)
 
         if not source.exists() or source.stat().st_size == 0:
             raise RuntimeError("Telegram media download failed")
