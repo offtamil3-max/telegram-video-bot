@@ -3,6 +3,7 @@ import math
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import selectable_parts
@@ -83,6 +84,20 @@ def make_part_compat(src, bg, out, start, length, overlay_text, footer_text, aud
     subprocess.run(cmd, check=True, timeout=900)
 
 
+async def start_manual(event):
+    if event.sender_id:
+        selectable_parts.cleanup(event.sender_id)
+    await event.respond(
+        "🎬 40-Second Video Splitter\n\n"
+        "1️⃣ முதலில் Background Photo அனுப்புங்கள்.\n"
+        "2️⃣ அடுத்து Full Video அனுப்புங்கள்.\n"
+        "3️⃣ எல்லா Audio tracks-லும் தேவையான track-ஐ தேர்வு செய்யுங்கள்.\n"
+        "4️⃣ Season / Episode அல்லது Movie தேர்வு செய்யுங்கள்.\n"
+        "5️⃣ கீழே வர வேண்டிய custom text-ஐ அனுப்பி Confirm செய்யுங்கள்.\n"
+        "6️⃣ தேவையான Part-ஐ மட்டும் தேர்வு செய்யுங்கள்."
+    )
+
+
 async def cancel_manual(event):
     selectable_parts.cleanup(event.sender_id)
     await event.respond("✅ Cancelled.")
@@ -98,7 +113,7 @@ async def photo_manual(event):
     old = selectable_parts.sessions.pop(uid, None)
     if old:
         shutil.rmtree(old.get("dir", ""), ignore_errors=True)
-    d = shutil.mkdtemp(prefix=f"video_{uid}_")
+    d = tempfile.mkdtemp(prefix=f"video_{uid}_")
     bg = Path(d) / "background.jpg"
     try:
         await selectable_parts.client.download_media(msg, file=str(bg))
@@ -302,8 +317,12 @@ async def main():
         client.remove_event_handler(callback, builder)
 
     client.add_event_handler(
+        start_manual,
+        events.NewMessage(incoming=True, pattern=r"^/start(?:@\w+)?$")
+    )
+    client.add_event_handler(
         cancel_manual,
-        events.NewMessage(incoming=True, pattern=r"^/(?:reset|cancel)$"),
+        events.NewMessage(incoming=True, pattern=r"^/(?:reset|cancel)(?:@\w+)?$")
     )
     client.add_event_handler(
         photo_manual,
