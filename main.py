@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,6 @@ API_ID = os.environ.get("TELEGRAM_API_ID")
 API_HASH = os.environ.get("TELEGRAM_API_HASH")
 CHUNK_SECONDS = 40
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-FFPROBE = FFMPEG.replace("ffmpeg", "ffprobe")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
@@ -51,12 +51,25 @@ def start_health_server():
 
 
 def ffprobe_duration(path: Path) -> float:
+    # Render does not have a separate ffprobe binary. imageio-ffmpeg bundles
+    # ffmpeg, so use ffmpeg's input inspection output to read the duration.
     result = subprocess.run(
-        [FFPROBE, "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        capture_output=True, text=True, check=True, timeout=60,
+        [FFMPEG, "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
     )
-    return float(result.stdout.strip())
+    match = re.search(
+        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
+        result.stderr,
+    )
+    if not match:
+        raise RuntimeError(
+            f"Could not read video duration. ffmpeg output: {result.stderr[-1000:]}"
+        )
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def make_chunk(src: Path, dst: Path, start: float, duration: float) -> None:
