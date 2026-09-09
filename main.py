@@ -178,10 +178,9 @@ async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    builder = Application.builder().token(BOT_TOKEN)
-    if LOCAL_BOT_API_URL:
-        builder = builder.base_url(f"{LOCAL_BOT_API_URL}/bot").base_file_url(f"{LOCAL_BOT_API_URL}/file/bot").local_mode(True)
-    app = builder.build()
+    # Use the official Telegram Bot API for normal bot operations.
+    # Use the Local Bot API only for downloading the large file from its local storage.
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("reset", cancel))
