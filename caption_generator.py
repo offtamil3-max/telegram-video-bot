@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 import requests
+import selectable_parts
 
 AI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 AI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
@@ -18,7 +19,7 @@ def _frame(video: Path, seconds: float) -> str | None:
     p = Path(name)
     try:
         r = subprocess.run([
-            "ffmpeg", "-y", "-ss", str(max(0, seconds)), "-i", str(video),
+            selectable_parts.FFMPEG, "-y", "-ss", str(max(0, seconds)), "-i", str(video),
             "-frames:v", "1", "-vf", "scale=768:-2", "-q:v", "5", str(p)
         ], capture_output=True, timeout=60)
         if r.returncode != 0 or not p.exists():
@@ -42,13 +43,13 @@ def _fallback(part: int, audio: str, filename: str) -> str:
     )
 
 
-def generate(video: Path, part: int, audio: str, filename: str, start: float, length: float) -> str:
+def generate(video: Path, part: int, audio: str, filename: str, length: float) -> str:
     if not AI_API_KEY:
         return _fallback(part, audio, filename)
 
     frames = []
     for sec in (0.5, max(0.5, length / 2), max(0.5, length - 0.5)):
-        img = _frame(video, start + min(sec, max(0.1, length - 0.1)))
+        img = _frame(video, min(sec, max(0.1, length - 0.1)))
         if img:
             frames.append(img)
     if not frames:
@@ -60,9 +61,10 @@ def generate(video: Path, part: int, audio: str, filename: str, start: float, le
             "You create Instagram Reels metadata for anime/movie clips. "
             "Return ONLY valid JSON with keys title, summary, caption, hashtags. "
             "ALL text must be natural Tamil except the exact audio name and hashtag tokens. "
-            "The FIRST words of caption MUST be exactly 'Link in Bio'. "
+            "The FIRST words of the caption MUST be exactly 'Link in Bio'. "
             "Title must be short, catchy and suitable for a trending Reel. "
-            "Do not claim facts that cannot be seen. Do not mention copyrighted lyrics. "
+            "Summary must describe only what is visible in these frames. "
+            "Do not claim facts that cannot be seen. Do not reproduce copyrighted lyrics. "
             f"This is Part {part}. Selected audio track name exactly as stored: {audio!r}. "
             f"Original filename: {filename!r}. Part duration: {length:.1f}s."
         )
@@ -84,17 +86,13 @@ def generate(video: Path, part: int, audio: str, filename: str, start: float, le
             timeout=90,
         )
         r.raise_for_status()
-        data = r.json()
-        text = data["choices"][0]["message"]["content"].strip()
-        obj = json.loads(text)
+        obj = json.loads(r.json()["choices"][0]["message"]["content"].strip())
         title = str(obj.get("title", "")).strip()
         summary = str(obj.get("summary", "")).strip()
         caption = str(obj.get("caption", "")).strip()
         hashtags = str(obj.get("hashtags", "")).strip()
         if not title or not summary or not caption:
             raise ValueError("Incomplete AI response")
-        if not caption.lower().startswith("link in bio"):
-            caption = "Link in Bio 🔗\n\n" + caption
         return (
             f"Link in Bio 🔗\n\n"
             f"🎬 {title} — Part {part}\n\n"
@@ -102,7 +100,7 @@ def generate(video: Path, part: int, audio: str, filename: str, start: float, le
             f"{caption.removeprefix('Link in Bio').strip()}\n\n"
             f"🎵 Song: {audio}\n\n"
             f"{hashtags}"
-        )
+        )[:1024]
     except Exception as e:
         print(f"Caption generation fallback: {type(e).__name__}: {e}")
-        return _fallback(part, audio, filename)
+        return _fallback(part, audio, filename)[:1024]
