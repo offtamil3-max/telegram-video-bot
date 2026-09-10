@@ -4,7 +4,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -19,7 +18,6 @@ API_HASH = os.environ["TELEGRAM_API_HASH"]
 BOT_ROLE = os.environ.get("BOT_ROLE", "primary").lower()
 CHUNK = 40
 DOWNLOAD_REQUEST = 512 * 1024
-DOWNLOAD_WORKERS = 2
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 sessions, locks, active = {}, {}, set()
@@ -77,44 +75,13 @@ def next_keyboard(total, dur, current):
     return rows
 
 
-async def _download_range(message, dest, start, end, state):
-    written = 0
-    async for chunk in client.iter_download(
-        message, offset=start, request_size=DOWNLOAD_REQUEST,
-        chunk_size=DOWNLOAD_REQUEST, file_size=getattr(message.file, "size", None)
-    ):
-        remaining = end - (start + written)
-        data = chunk[:remaining]
-        with dest.open("r+b") as f:
-            f.seek(start + written)
-            f.write(data)
-        written += len(data)
-        state["n"] += len(data)
-        if start + written >= end:
-            break
-    if written != end - start:
-        raise RuntimeError(f"Download range incomplete: {start}-{end}, got {written} bytes")
-
-
-async def _parallel_download(message, dest, size, state):
-    with dest.open("wb") as f:
-        f.truncate(size)
-    step = math.ceil(size / DOWNLOAD_WORKERS / DOWNLOAD_REQUEST) * DOWNLOAD_REQUEST
-    ranges = []
-    start = 0
-    while start < size:
-        end = min(size, start + step)
-        ranges.append((start, end))
-        start = end
-    await asyncio.gather(*(_download_range(message, dest, a, b, state) for a, b in ranges))
-
-
 async def download(message, dest, status):
     size = getattr(message.file, "size", 0) or 0
     if size <= 0:
         raise RuntimeError("Telegram did not provide the video size")
     state = {"n": 0}
     started = time.monotonic()
+
     async def show():
         last = ""
         while True:
@@ -124,16 +91,20 @@ async def download(message, dest, status):
             elapsed = max(time.monotonic() - started, 0.1)
             speed = cur / elapsed / 1024 / 1024
             eta = (size - cur) / max(speed * 1024 * 1024, 1)
-            text = f"📥 Full video download\n{pct:.0f}% • {cur / 1024 / 1024:.1f} / {size / 1024 / 1024:.1f} MB\n⚡ {speed:.2f} MB/s • ETA ~{int(eta)}s"
+            text = f"📥 Full video download\n{pct:.0f}% • {cur/1024/1024:.1f} / {size/1024/1024:.1f} MB\n⚡ {speed:.2f} MB/s • ETA ~{int(eta)}s"
             if text != last:
                 try:
                     await status.edit(text)
                     last = text
                 except Exception:
                     pass
+
     task = asyncio.create_task(show())
     try:
-        await _parallel_download(message, dest, size, state)
+        with dest.open("wb") as f:
+            async for chunk in client.iter_download(message.media, request_size=DOWNLOAD_REQUEST):
+                f.write(chunk)
+                state["n"] += len(chunk)
     finally:
         task.cancel()
         try:
@@ -143,18 +114,32 @@ async def download(message, dest, status):
     if not dest.exists() or dest.stat().st_size != size:
         raise RuntimeError("Downloaded video file is missing or incomplete")
     elapsed = max(time.monotonic() - started, 0.1)
-    await status.edit(f"✅ Full video downloaded\n{size / 1024 / 1024:.1f} MB • {size / elapsed / 1024 / 1024:.2f} MB/s")
+    await status.edit(f"✅ Full video downloaded\n{size/1024/1024:.1f} MB • {size/elapsed/1024/1024:.2f} MB/s")
 
 
 def make_part_clean(src, out, start, length, audio_stream):
-    subprocess.run([
+    common = [
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
         "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{length:.3f}",
         "-map", "0:v:0", "-map", f"0:{audio_stream}", "-sn", "-dn",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-        "-ar", "48000", "-ac", "2", "-movflags", "+faststart", str(out)
-    ], check=True, timeout=900)
+    ]
+    # Best quality: copy the original video/audio streams without re-encoding.
+    r = subprocess.run(common + ["-c", "copy", "-movflags", "+faststart", str(out)], capture_output=True, text=True, timeout=900)
+    if r.returncode == 0 and out.exists() and out.stat().st_size > 1024:
+        print(f"{out.name}: stream copy OK")
+        return
+
+    # If the selected audio cannot be copied to MP4, keep the original video and encode only audio.
+    out.unlink(missing_ok=True)
+    r = subprocess.run(common + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", str(out)], capture_output=True, text=True, timeout=900)
+    if r.returncode == 0 and out.exists() and out.stat().st_size > 1024:
+        print(f"{out.name}: video copy + audio encode OK")
+        return
+
+    # Last resort only: re-encode the selected part at high quality.
+    out.unlink(missing_ok=True)
+    subprocess.run(common + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", str(out)], check=True, timeout=900)
+    print(f"{out.name}: full re-encode fallback")
 
 
 def send_part(chat, out, caption):
@@ -162,11 +147,7 @@ def send_part(chat, out, caption):
     if mb >= 49:
         raise RuntimeError(f"Part too large: {mb:.2f} MB")
     with out.open("rb") as f:
-        r = requests.post(
-            f"{BOT_API}/sendVideo",
-            data={"chat_id": str(chat), "caption": caption, "supports_streaming": "true"},
-            files={"video": (out.name, f, "video/mp4")}, timeout=(30, 900)
-        )
+        r = requests.post(f"{BOT_API}/sendVideo", data={"chat_id": str(chat), "caption": caption, "supports_streaming": "true"}, files={"video": (out.name, f, "video/mp4")}, timeout=(30, 900))
     if not r.ok or not r.json().get("ok"):
         raise RuntimeError(r.text[-1000:])
 
