@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import caption_generator
 import selectable_parts
 from telethon import Button, events
 
@@ -63,7 +64,7 @@ def audio_keyboard(tracks):
 
 async def start_manual(event):
     selectable_parts.cleanup(event.sender_id)
-    await event.respond("🎬 40-Second Video Splitter\n\n📤 உங்கள் Video-வை அனுப்புங்கள்.\n\n🎧 Audio track-ஐ நீங்கள் manually தேர்வு செய்யலாம்.\n🎬 பிறகு தேவையான 40-second Part-ஐ தேர்வு செய்யலாம்.\n\n❌ Background / watermark / text எதுவும் சேர்க்கப்படாது.")
+    await event.respond("🎬 40-Second Video Splitter\n\n📤 உங்கள் Video-வை அனுப்புங்கள்.\n\n🎧 Audio track-ஐ நீங்கள் manually தேர்வு செய்யலாம்.\n🎬 பிறகு தேவையான 40-second Part-ஐ தேர்வு செய்யலாம்.\n\n📱 Part send ஆகும்போது Tamil Instagram caption + title + summary + hashtags auto-generate ஆகும்.\n🔗 Caption எப்போதும் `Link in Bio` என்று தொடங்கும்.\n\n❌ Background / watermark / text எதுவும் video-வில் சேர்க்கப்படாது.")
 
 
 async def cancel_manual(event):
@@ -87,6 +88,7 @@ async def video_manual(event):
         shutil.rmtree(old.get("dir", ""), ignore_errors=True)
     d = Path(tempfile.mkdtemp(prefix=f"video_{uid}_"))
     src = d / "video_source"
+    original_name = getattr(msg.file, "name", None) or "video.mp4"
     status = await event.respond("📥 Full video download தொடங்குகிறது...\n0%")
     selectable_parts.active.add(uid)
     try:
@@ -97,6 +99,7 @@ async def video_manual(event):
         selectable_parts.sessions[uid] = {
             "dir": str(d),
             "source": str(src),
+            "filename": original_name,
             "duration": dur,
             "total": total,
             "audio_tracks": tracks,
@@ -182,7 +185,21 @@ async def callback_manual(event):
         try:
             await event.edit(f"⏳ Part {i + 1} தயாராகிறது...\n🕐 {selectable_parts.ts(start)} → {selectable_parts.ts(start + length)}")
             await asyncio.to_thread(selectable_parts.make_part_clean, Path(s["source"]), out, start, length, s["audio_stream"])
-            await asyncio.to_thread(selectable_parts.send_part, uid, out, f"🎬 Part {i + 1} • {selectable_parts.ts(start)} → {selectable_parts.ts(start + length)}")
+            await event.edit(f"📝 Part {i + 1} க்கான Tamil Instagram caption உருவாக்கப்படுகிறது...")
+            caption = await asyncio.to_thread(
+                caption_generator.generate,
+                out,
+                i + 1,
+                s.get("audio_label", ""),
+                s.get("filename", "video.mp4"),
+                length,
+            )
+            await asyncio.to_thread(
+                selectable_parts.send_part,
+                uid,
+                out,
+                caption,
+            )
             out.unlink(missing_ok=True)
             if i + 1 < s["total"]:
                 await event.edit("✅ Part sent.\n\n👇 Next Part:", buttons=selectable_parts.next_keyboard(s["total"], s["duration"], i))
